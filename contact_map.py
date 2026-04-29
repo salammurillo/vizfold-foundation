@@ -1,10 +1,14 @@
+import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from Bio import PDB
-import sys
 
-sys.path.insert(0, "/storage/ice1/6/0/salammurillo3/openfold")
+# Repo root — all relative paths are anchored here
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
 from openfold.config import model_config
 from openfold.model.model import AlphaFold
@@ -15,17 +19,30 @@ from openfold.model.triangular_attention import TriangleAttention
 from openfold.model.primitives import Attention, softmax_no_cast, permute_final_dims
 import openfold.model.primitives as primitives
 
-# CONFIG
-LAYER_START = 38
-LAYER_END   = 47
+# Config is passed via environment variables by generate_contact_map.py.
+def _require(var):
+    val = os.environ.get(var)
+    if not val:
+        sys.exit(f"error: {var} not set — run this script via generate_contact_map.py")
+    return val
 
-FASTA_PATH    = "/home/hice1/salammurillo3/scratch/openfold/examples/monomer/fasta_dir/6kwc.fasta"
-ALIGNMENT_DIR = "/home/hice1/salammurillo3/scratch/openfold/examples/monomer/alignments/6KWC_1"
-PDB_PATH      = "/home/hice1/salammurillo3/scratch/openfold/outputs/predictions/6KWC_1_model_1_ptm_relaxed.pdb"
-PARAMS_PATH   = "openfold/resources/params/params_model_1_ptm.npz"
+CONFIG_PRESET     = _require("CM_CONFIG_PRESET")
+FASTA_PATH        = _require("CM_FASTA_PATH")
+ALIGNMENT_DIR     = _require("CM_ALIGNMENT_DIR")
+OUTPUT_DIR        = os.environ.get("CM_OUTPUT_DIR",         os.path.join(SCRIPT_DIR, "outputs"))
+PARAMS_PATH       = os.environ.get("CM_PARAMS_PATH",        os.path.join(SCRIPT_DIR, "openfold", "resources", "params", f"params_{CONFIG_PRESET}.npz"))
+CHAIN_ID          = os.environ.get("CM_CHAIN_ID",           "A")
+LAYER_START       = int(os.environ.get("CM_LAYER_START",    "38"))
+LAYER_END         = int(os.environ.get("CM_LAYER_END",      "47"))
+CONTACT_THRESHOLD = float(os.environ.get("CM_CONTACT_THRESHOLD", "8.0"))
+REGION_START      = int(os.environ["CM_REGION_START"]) if "CM_REGION_START" in os.environ else None
+REGION_END        = int(os.environ["CM_REGION_END"])   if "CM_REGION_END"   in os.environ else None
+
+protein_tag = os.path.splitext(os.path.basename(FASTA_PATH))[0].upper()
+PDB_PATH    = os.environ.get("CM_PDB_PATH", os.path.join(OUTPUT_DIR, "predictions", f"{protein_tag}_1_{CONFIG_PRESET}_relaxed.pdb"))
 
 
-# 1 Contact map from PDB
+# 1  Contact map from PDB
 def get_distance_matrix(pdb_path, chain_id="A"):
     parser = PDB.PDBParser(QUIET=True)
     structure = parser.get_structure("protein", pdb_path)
@@ -41,12 +58,13 @@ def get_distance_matrix(pdb_path, chain_id="A"):
     diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
     return np.sqrt((diff ** 2).sum(axis=-1))
 
-dist_matrix = get_distance_matrix(PDB_PATH)
-print(f"Protein length: {len(dist_matrix)} residues")
+dist_matrix = get_distance_matrix(PDB_PATH, CHAIN_ID)
+N = dist_matrix.shape[0]
+print(f"Protein: {protein_tag}  |  Length: {N} residues")
 
 
-# 2 Patch _attention to capture softmax weights 
-_capture = False
+# 2  Patch _attention to capture softmax weights
+_capture = [False]
 _attn_weights_store = []
 
 _orig_attention = primitives._attention
@@ -57,25 +75,22 @@ def _patched_attention(query, key, value, biases):
     for b in biases:
         a += b
     a = softmax_no_cast(a, -1)
-    if _capture:
+    if _capture[0]:
         _attn_weights_store.append(a.detach().cpu())
     return torch.matmul(a, value)
 
 primitives._attention = _patched_attention
 Attention.forward.__globals__["_attention"] = _patched_attention
 
-print(f"Patch live in primitives: {primitives._attention is _patched_attention}")
-print(f"Patch live in Attention.forward globals: {Attention.forward.__globals__['_attention'] is _patched_attention}")
 
-
-# 3 Load model
-config = model_config("model_1_ptm")
+# 3  Load model
+config = model_config(CONFIG_PRESET)
 model  = AlphaFold(config).eval().cuda()
-import_jax_weights_(model, PARAMS_PATH, version="model_1_ptm")
+import_jax_weights_(model, PARAMS_PATH, version=CONFIG_PRESET)
 print("Model loaded.")
 
 
-# 4 Register pre/post hooks to toggle capture for target layers only
+# 4  Register hooks to toggle capture for target layers only
 def get_layer_idx(name):
     parts = name.split(".")
     for i, p in enumerate(parts):
@@ -93,27 +108,25 @@ for name, module in model.named_modules():
         continue
     if not name.startswith("evoformer"):
         continue
-    layer_idx = get_layer_idx(name)
-    if not (LAYER_START <= layer_idx <= LAYER_END):
+    if not (LAYER_START <= get_layer_idx(name) <= LAYER_END):
         continue
 
-    def make_hooks(n):
-        def pre_hook(module, input):
-            global _capture
-            _capture = True
-        def post_hook(module, input, output):
-            global _capture
-            _capture = False
+    def make_hooks():
+        def pre_hook(_module, _input):
+            _capture[0] = True
+        def post_hook(_module, _input, _output):
+            _capture[0] = False
         return pre_hook, post_hook
 
-    pre, post = make_hooks(name)
+    pre, post = make_hooks()
     hooks.append(module.register_forward_pre_hook(pre))
     hooks.append(module.register_forward_hook(post))
 
-print(f"Hooks registered on {len(hooks) // 2} triangle attention modules (layers {LAYER_START}–{LAYER_END}).")
+print(f"Hooks registered on {len(hooks) // 2} TriangleAttention modules "
+      f"(layers {LAYER_START}–{LAYER_END}).")
 
 
-# 5 Run inference
+# 5  Run inference
 data_proc    = DataPipeline(template_featurizer=None)
 feature_proc = FeaturePipeline(config.data)
 features     = data_proc.process_fasta(fasta_path=FASTA_PATH, alignment_dir=ALIGNMENT_DIR)
@@ -132,64 +145,66 @@ primitives._attention = _orig_attention
 Attention.forward.__globals__["_attention"] = _orig_attention
 
 print(f"Captured {len(_attn_weights_store)} attention weight tensors.")
-if _attn_weights_store:
-    print(f"Sample shape: {_attn_weights_store[0].shape}")
 
 
-# 6 Aggregate: mean over heads and recycles, then over layers
+# 6  Aggregate: mean over heads and recycles, then over layers
 if not _attn_weights_store:
-    raise RuntimeError("No attention weights captured.")
+    raise RuntimeError("No attention weights captured — check LAYER_START/LAYER_END.")
 
-N = dist_matrix.shape[0]
 tensors = []
 for t in _attn_weights_store:
-    # Shape: (1, N_res, H, N_res, N_res) — squeeze batch, then mean over everything
-    # except the last two (N, N) dims
-    t = t.squeeze(0)                         # drop batch dim
-    shape = t.shape
-    print(f"  Processing tensor shape: {list(shape)}")
-    if shape[-1] == N and shape[-2] == N:
-        # Flatten all leading dims and mean → (N, N)
-        t = t.reshape(-1, N, N).float().mean(dim=0).numpy()
-    else:
-        raise ValueError(f"Unexpected shape {shape}, expected last two dims to be {N}")
-    tensors.append(t)
+    t = t.squeeze(0)
+    if t.shape[-1] != N or t.shape[-2] != N:
+        raise ValueError(f"Unexpected shape {list(t.shape)}, expected last two dims {N}")
+    tensors.append(t.reshape(-1, N, N).float().mean(dim=0).numpy())
 
 attn_map = np.stack(tensors).mean(axis=0)
 attn_map = (attn_map + attn_map.T) / 2
 print(f"Final attention map shape: {attn_map.shape}")
 
 
-# 7 Plot
+# 7  Plot
+r0 = REGION_START if REGION_START is not None else 0
+r1 = REGION_END   if REGION_END   is not None else N
+
+dist_plot = dist_matrix[r0:r1, r0:r1]
+attn_plot = attn_map[r0:r1, r0:r1]
+
+# extent keeps axis labels in actual residue-index space
+extent = [r0 - 0.5, r1 - 0.5, r0 - 0.5, r1 - 0.5]
+region_label = f"residues {r0}–{r1 - 1}" if (REGION_START is not None or REGION_END is not None) else "all residues"
+
 fig, axes = plt.subplots(1, 3, figsize=(20, 6))
 
-# Distance map
-im1 = axes[0].imshow(dist_matrix, cmap="viridis_r", origin="lower")
+im1 = axes[0].imshow(dist_plot, cmap="viridis_r", origin="lower", extent=extent)
 axes[0].set_title("Cα Distance Map")
 axes[0].set_xlabel("Residue index")
 axes[0].set_ylabel("Residue index")
 plt.colorbar(im1, ax=axes[0], label="Distance (Å)")
 
-# Binary contact map
-axes[1].imshow(dist_matrix < 8.0, cmap="Greys", origin="lower")
-axes[1].set_title("Contact Map (Cα < 8Å)")
+axes[1].imshow(dist_plot < CONTACT_THRESHOLD, cmap="Greys", origin="lower", extent=extent)
+axes[1].set_title(f"Contact Map (Cα < {CONTACT_THRESHOLD} Å)")
 axes[1].set_xlabel("Residue index")
 axes[1].set_ylabel("Residue index")
 
-# True attention weights overlaid on contact map
-contacts_i, contacts_j = np.where(dist_matrix < 8.0)
-im3 = axes[2].imshow(attn_map, cmap="hot_r", origin="lower")
-axes[2].scatter(contacts_j, contacts_i, s=0.3, c="cyan", alpha=0.5, label="Cα < 8Å")
-axes[2].set_title(f"Triangle Attention Weights (layers {LAYER_START}–{LAYER_END})\nMean over heads + recycles + layers")
+contacts_i, contacts_j = np.where(dist_plot < CONTACT_THRESHOLD)
+im3 = axes[2].imshow(attn_plot, cmap="hot_r", origin="lower", extent=extent)
+axes[2].scatter(contacts_j + r0, contacts_i + r0, s=0.3, c="cyan", alpha=0.5,
+                label=f"Cα < {CONTACT_THRESHOLD} Å")
+axes[2].set_title(f"Triangle Attention (layers {LAYER_START}–{LAYER_END})\n"
+                  "Mean over heads + recycles + layers")
 axes[2].set_xlabel("Residue index")
 axes[2].set_ylabel("Residue index")
 plt.colorbar(im3, ax=axes[2], label="Attention weight")
 axes[2].legend(markerscale=10, fontsize=8)
 
-plt.suptitle("6KWC_1 — Contact Map + True Triangle Attention Weights", fontsize=13, fontweight="bold")
+plt.suptitle(f"{protein_tag} — Contact Map + Triangle Attention Weights ({region_label})",
+             fontsize=13, fontweight="bold")
 plt.tight_layout()
-plt.savefig(f"contact_attention_{LAYER_START}-{LAYER_END}.png", dpi=150, bbox_inches="tight")
-print(f"Saved to contact_attention_{LAYER_START}-{LAYER_END}.png")
-plt.show()
 
- 
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+region_suffix = f"_r{r0}-{r1 - 1}" if (REGION_START is not None or REGION_END is not None) else ""
+out_name = os.path.join(OUTPUT_DIR, f"contact_attention_{protein_tag}_{LAYER_START}-{LAYER_END}{region_suffix}.png")
+plt.savefig(out_name, dpi=150, bbox_inches="tight")
+print(f"Saved to {out_name}")
+plt.show()
